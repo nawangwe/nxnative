@@ -437,6 +437,8 @@ static void ft_add(const tex_t *t) {
     if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     f.span = nvn_dirty_span(t->mem, t->L.size);
     if (DM_GAME_TEX_DIRTY_UPLOAD) ft_edges_take(&f);
+    { int cputex_traced(const tex_t *); if (cputex_traced(t)) LOG("[cputex] registered ser=%llu %ux%u fmt %#x flags %#x pool flags %#x mem %p +%llu: stamp %llu, tracked %d", (unsigned long long)t->serial, t->d.width, t->d.height,   // diag
+                                                             t->d.format, t->d.flags, t->pool->flags, (void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)f.stamp, f.span != NULL); }
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     g_ft[g_nft++] = f;
@@ -460,6 +462,11 @@ int nvn_ft_written(const tex_t *t) {
     pthread_mutex_unlock(&g_ft_mu);
     if (r) mtl_tex_cpu_written(t);
     return r;
+}
+int nvn_ft_state(uint64_t serial, uint64_t *stamp, int *edged) {   // diag (DM_NVN_CPUTEX_TRACE, nvn_diag_tail.inc): the flush-tracking entry of a serial
+    int r = 0; pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { *stamp = g_ft[i].stamp; *edged = g_ft[i].edged; r = 1; break; }
+    pthread_mutex_unlock(&g_ft_mu); return r;
 }
 int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its storage holds whatever the CPU has written (nvn_tex_mirror_b2t / nvn_tex_mirror_t2t)
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return 0;
@@ -1127,6 +1134,8 @@ NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NV
     r->depth = tex_snap(r, SNAP_OFF(p_set_rt), n, dt, (uint64_t)__builtin_return_address(0)); copy_view(&r->dview, &r->has_dview, dv);
     for (int i = 0; i < n; i++) if (r->color[i]) mtl_tex_gpu_written(r->color[i]);
     if (r->depth) mtl_tex_gpu_written(r->depth);
+    { int cputex_traced(const tex_t *); for (int i = 0; i < n; i++) if (r->color[i] && cputex_traced(r->color[i])) LOG("[cputex] GPU render target recorded ser=%llu %ux%u fmt %#x mem %p +%llu (dirty now %llu)",   // diag
+          (unsigned long long)r->color[i]->serial, r->color[i]->d.width, r->color[i]->d.height, r->color[i]->d.format, (void *)r->color[i]->mem, (unsigned long long)r->color[i]->L.size, (unsigned long long)nvn_dirty_now()); }
 }
 NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const float *rgba, int mask) {
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; memcpy(r->rgba, rgba, 16);

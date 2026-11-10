@@ -1480,6 +1480,7 @@ static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also end
 static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
 static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
 static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+#include "nvn_diag.inc"   // diag: local diagnostics (fork branch "diagnostics")
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
@@ -4362,8 +4363,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         }
     }
     id have = tex_get(t->serial);
-    if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
-    if (!packaged && !have && on_sub_thread() && tex_cpu_content(t)) { mtl_tex_cpu_written(t); packaged = 1; }   // storage the CPU wrote before its first use (tex_cpu_content)
+    int diag_pkg0 = packaged, diag_ft = -1, diag_cc = -1;   // diag: DM_NVN_CPUTEX_TRACE
+    if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = diag_ft = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
+    if (!packaged && !have && on_sub_thread() && (diag_cc = tex_cpu_content(t))) { mtl_tex_cpu_written(t); packaged = 1; }   // storage the CPU wrote before its first use (tex_cpu_content)
+    if (!have && !diag_pkg0) diag_cputex_first(t, diag_pkg0, diag_ft, diag_cc, packaged);   // diag
     if (!packaged && !have && on_sub_thread() && linear_storage_ok(t)) {   // a linear texture no view on its buffer can take (iOS wants 64-byte rows; Axiom Verge's 8x8 RGBA8 linear textures have 32): uploaded, and again after CPU writes
         uint32_t pf; void *mb; uint64_t mo; size_t row;
         if (linear_fit(t, &pf, &mb, &mo, &row) < 0) {
@@ -5075,6 +5078,7 @@ static void rp_end_at(const char *fn, int line) { if (g_enc) { AP_B; geo_mesh_fl
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
     if (g_nrtm) rt_mirror_flush();
+    diag_coldump_pass_end();   // diag: DM_CTL "coldump"
 #ifdef NVN_RT_RANGE_TEST
     rr_finish(ranged);
 #endif
@@ -6392,6 +6396,7 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
         g_sview_w = realloc_or_die(g_sview_w, n * sizeof *g_sview_w, "the sampler registrations"); g_srid_w = realloc_or_die(g_srid_w, n * sizeof *g_srid_w, "the sampler registrations"); g_sbk = realloc_or_die(g_sbk, n * sizeof *g_sbk, "the sampler registrations");
         memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); memset(g_sview + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview); memset(g_srid + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid);
         memset(g_sview_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sview_w); memset(g_srid_w + g_nsreg, 0, (n - g_nsreg) * sizeof *g_srid_w); g_nsreg = n; }
+    if (g_sreg_ok[id_]) diag_samp_again(id_, &g_sreg[id_], sp, g_sview[id_] != NULL);   // diag: DM_CTL "sampinfo"
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
@@ -6741,7 +6746,9 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // Caller holds g_rmu
     int bn, bw; float k[4]; const uint8_t wrap[3] = { p.ws, p.wt, p.wr }; int twin = nvn_border(p.border, wrap, p.reduction, &bn, &bw, k);   // border colours Metal lacks (nvn_border.h)
     d.borderColor = (MTLSamplerBorderColor)bn;
     d.supportArgumentBuffers = YES;
+    d.label = [NSString stringWithFormat:@"sid %d " SP_FMT " (made at frame %llu)", sid, SP_ARG(p), (unsigned long long)atomic_load(&g_cur_frame)];   // diag: what the live object was made from
     id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
+    if (!s) { static uint64_t nf; if (nf++ < 20) MLOG("[RED] sampler ID %d: Metal refused the sampler state (%llu refusals so far)", sid, (unsigned long long)nf); }   // diag
     if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
     if (s && twin) {
         d.borderColor = (MTLSamplerBorderColor)bw; id<MTLSamplerState> t = [g_dev newSamplerStateWithDescriptor:d];
@@ -9471,7 +9478,8 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     id<MTLDepthStencilState> s = hm_get_id(&g_dss, &k);
     if (s) return s;
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
-    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw; }
+    if (has_depth && S.ds.dt) { d.depthCompareFunction = (MTLCompareFunction)(S.ds.df - 1); d.depthWriteEnabled = S.ds.dw;
+        if (S.ds.df == 3 && !S.ds.dw && diag_equal_leq()) d.depthCompareFunction = MTLCompareFunctionLessEqual; }   // diag: DM_NVN_EQUAL_LEQ
     if (has_stencil && S.ds.st) {
         MTLStencilDescriptor *f = [MTLStencilDescriptor new], *b = [MTLStencilDescriptor new];
         f.stencilCompareFunction = (MTLCompareFunction)(S.ds.sf_f - 1); f.stencilFailureOperation = (MTLStencilOperation)(S.ds.fail_f - 1);
@@ -13354,6 +13362,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
     // DM_NVN_SKIP_FS / DM_NVN_UB (skip_fs_draw)
     { if (skip_fs_draw(pr)) return;
+      if (diag_draw_skip(pr)) return;   // diag: DM_CTL "skip" / "coldump"
       if (ms_draw(pr)) return; }
     // Similar diagnostic DM_NVN_SKIP_SMALL=<width>: drop all draws whose target width (by the attached level) is <= this value -- measures how much "dropping tiny render passes in bulk" is worth under the parallel pipeline (fixed per-pass overhead)
     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL: dropping draws whose target width is ≤ %d (diagnostic; the picture is wrong)", small); }
@@ -13436,8 +13445,10 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     static char dko[8][24]; static int ndko = -1;
     if (ndko < 0) { ndko = 0; const char *e = getenv("DM_NVN_DEPTHOVR");
         for (const char *q = e; q && *q && ndko < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(dko[ndko], q, n); dko[ndko++][n] = 0; } }
-    if (ndko) { int ovr = 0; for (int i = 0; i < ndko && pr->sh[1]; i++) ovr |= !strncmp(pr->sh[1]->key, dko[i], strlen(dko[i]));
-        unsigned df0 = (unsigned)S.ds.df; if (ovr) S.ds.df = 8; cur_ds = dss_get(g_pass.hd, g_pass.hs); S.ds.df = df0; cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
+    if (ndko || g_live_novr || g_live_bias != 0.f) { int ovr = 0; for (int i = 0; i < ndko && pr->sh[1]; i++) ovr |= !strncmp(pr->sh[1]->key, dko[i], strlen(dko[i]));
+        if (g_live_novr && pr->sh[1]) ovr |= live_match(0, pr->sh[1]->key);   // diag: DM_CTL "ovr"
+        unsigned df0 = (unsigned)S.ds.df; if (ovr) S.ds.df = 8; else if (g_live_bias != 0.f && S.ds.df == 3 && !S.ds.dw) S.ds.df = 4;   // diag: DM_CTL "bias": EQUAL → LESS_EQUAL
+        cur_ds = dss_get(g_pass.hd, g_pass.hs); S.ds.df = df0; cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     else if (g_dss_dirty || cur_ds_pass != g_pass.serial) { cur_ds = dss_get(g_pass.hd, g_pass.hs); cur_ds_pass = g_pass.serial; g_dss_dirty = 0; }
     if (cur_ds != g_enc_dss) { enc_r_dss(en, cur_ds); g_enc_dss = cur_ds; }
     { uint32_t sr = S.st_ref[0];   // enc_r_stencil_ref sends the front value only
@@ -13465,6 +13476,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
       int wi = (S.poly.front == NVN_FRONT_FACE_CCW) != g_queue_origin_ll ? MTLWindingCounterClockwise : MTLWindingClockwise;   // NVN's raster flip is captured when the queue is initialized, rather than when the device origin changes.
       int fi = S.poly.mode == NVN_POLYGON_MODE_LINE ? MTLTriangleFillModeLines : MTLTriangleFillModeFill, cl = !S.depth_clamp;   // depth clip off = SetDepthClamp
       float bi[3] = {0, 0, 0}; if (S.poly.offset_en & 4) { bi[0] = S.po.units; bi[1] = S.po.factor; bi[2] = S.po.clamp; }
+      if (g_live_bias != 0.f && S.ds.df == 3 && !S.ds.dw) bi[0] += g_live_bias;   // diag: DM_CTL "bias"
       if (!(g_ed.ok & ED_CULL) || g_ed.cull != cu) { enc_r_cull(en, (MTLCullMode)cu); g_ed.cull = cu; g_ed.ok |= ED_CULL; }
       if (!(g_ed.ok & ED_WIND) || g_ed.wind != wi) { enc_r_winding(en, (MTLWinding)wi); g_ed.wind = wi; g_ed.ok |= ED_WIND; }
       if (!(g_ed.ok & ED_FILL) || g_ed.fill != fi) { enc_r_fill(en, (MTLTriangleFillMode)fi); g_ed.fill = fi; g_ed.ok |= ED_FILL; }
@@ -14288,6 +14300,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (bc_alias_copy(c, s, sl, sz0, dl, dz0)) return;   // the destination aliases a compressed texture: the bytes go there, and the alias's own texture is not made (see bc_alias_copy)
     id<MTLTexture> d = tex_mtl(c->dst); sparse_gpu_wrote(c->dst);
     if (!d || !tex_level_ok(d, dl, "texture copy destination")) return;
+    diag_depth_copy(c, s, d, sl, sz0, dl, dz0);   // diag: DM_CTL "depthdump"
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
             enc_b_copy_texture(blit(), s, sz0, sl, MTLOriginMake(0, 0, 0), MTLSizeMake(s.width, s.height, 1), d, dz0, dl, MTLOriginMake(0, 0, 0));
@@ -16359,4 +16372,5 @@ void mem_census(const char *why) { @autoreleasepool {
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #include "nvn_ndve.inc"      // DM_NDVE_ENGINE (nn::ndve's movie network)
+#include "nvn_diag_tail.inc" // diag: local diagnostics (fork branch "diagnostics")
 #pragma clang attribute pop
